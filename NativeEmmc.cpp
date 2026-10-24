@@ -231,7 +231,7 @@ IOService *NativeEmmc::probe(IOService *provider, SInt32 *score)
 
 bool NativeEmmc::start(IOService *provider)
 {
-  if (!super::start(provider)) {
+  if (!IOService::start(provider)) {
     return false;
   }
 
@@ -292,5 +292,5 @@ bool NativeEmmc::start(IOService *provider)
 
 void NativeEmmc::stop(IOService *provider)
 {
-  super::stop(provider);
+  IOService::stop(provider);
 }
