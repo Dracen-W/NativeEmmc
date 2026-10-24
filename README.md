@@ -10,10 +10,10 @@ The driver is intentionally developed in small, observable stages:
 2. `native-emmc-probe=2`: issue one read-only `CMD17` for the first block of
    the iPadOS userdata partition and panic with the first 16 bytes. A successful
    read starts with `SHNGROOT`.
-3. Publish the OS and SystemOS windows through the same root-layout/root-publication
-   contract used by NativeUfs.
+3. `native-emmc-root=1`: validate the SHNGROOT manifest and publish the OS and
+   SystemOS windows as read-only 512-byte block devices, SystemOS first.
 
-The probe does not reset, initialize, tune or write the controller or card. It
+The driver does not reset, initialize, tune or write the controller or card. It
 depends on the state left by the platform UEFI firmware. No Apple binaries or
 other proprietary artifacts belong in this repository.
 
