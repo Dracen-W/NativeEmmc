@@ -18,9 +18,11 @@ extern "C" volatile uint32_t native_emmc_probe_calls;
 extern "C" volatile uint32_t native_emmc_matched;
 extern "C" volatile uint32_t native_emmc_probe_requested;
 
+extern "C" {
 volatile uint32_t native_emmc_probe_calls = 0;
 volatile uint32_t native_emmc_matched = 0;
 volatile uint32_t native_emmc_probe_requested = 0;
+}
 
 namespace {
 
