@@ -70,6 +70,7 @@ constexpr uint32_t MSDC_FIFOCS_RX_MASK = 0xff;
 constexpr uint32_t SDC_CMD_RSP_TYPE_SHIFT = 7;
 constexpr uint32_t SDC_CMD_SINGLE_BLK = 1U << 11;
 constexpr uint32_t SDC_CMD_MULTIPLE_BLK = 1U << 12;
+constexpr uint32_t SDC_CMD_STOP_CMD = 1U << 14;
 constexpr uint32_t SDC_CMD_BLK_SIZE_SHIFT = 16;
 constexpr uint32_t SDC_STS_BUSY = 1U << 0;
 
@@ -160,6 +161,29 @@ static bool waitNotBusy(uintptr_t base, uint32_t *failure)
 
 // Read blocks with one CMD18. The controller is not reinitialized: this is the
 // same PIO path UEFI used, with interrupts masked and completion polled.
+static void stopTransfer(uintptr_t base)
+{
+  uint32_t status = 0;
+  for (unsigned i = 0; i < 200000; i++) {
+    if ((read32(base, SDC_STS) & SDC_STS_BUSY) == 0) {
+      break;
+    }
+    IODelay(1);
+  }
+  write32(base, MSDC_INTEN, 0);
+  clearStatus(base, 0xffffffffU);
+  write32(base, SDC_ARG, 0);
+  write32(base, SDC_CMD, 12U | (7U << SDC_CMD_RSP_TYPE_SHIFT) | SDC_CMD_STOP_CMD);
+  waitCommand(base, &status);
+  clearStatus(base, status & (MSDC_INT_CMDRDY | MSDC_INT_ERROR));
+  for (unsigned i = 0; i < 200000; i++) {
+    if ((read32(base, SDC_STS) & SDC_STS_BUSY) == 0) {
+      break;
+    }
+    IODelay(1);
+  }
+}
+
 static bool readBlocks(uintptr_t base, uint64_t lba, uint32_t blocks, uint8_t *out, uint32_t *failure)
 {
   uint32_t status = 0;
@@ -231,6 +255,9 @@ static bool readBlocks(uintptr_t base, uint64_t lba, uint32_t blocks, uint8_t *o
   }
 
   clearStatus(base, status & (MSDC_INT_XFER_COMPL | MSDC_INT_ERROR));
+  if (blocks > 1) {
+    stopTransfer(base);
+  }
   *failure = 0;
   return true;
 }
