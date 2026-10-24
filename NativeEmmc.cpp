@@ -9,8 +9,12 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBSD.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSIterator.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSString.h>
 #include <libkern/libkern.h>
 #include <libkern/crypto/sha2.h>
 #include <kern/thread.h>
@@ -25,6 +29,9 @@ extern "C" {
 volatile uint32_t native_emmc_probe_calls = 0;
 volatile uint32_t native_emmc_matched = 0;
 volatile uint32_t native_emmc_probe_requested = 0;
+volatile uint32_t native_emmc_blocks_published = 0;
+volatile uint64_t native_emmc_block_reads = 0;
+volatile uint64_t native_emmc_block_failures = 0;
 }
 
 namespace {
@@ -348,6 +355,9 @@ static bool findEmmcLayout(uintptr_t base, EmmcLayout *layout)
 
 static IOLock *gControllerLock = nullptr;
 static uintptr_t gControllerBase = 0;
+static uint64_t gWindowLba[4];
+static uint64_t gWindowBytes[4];
+static unsigned gWindowCount;
 
 } // namespace
 
@@ -415,6 +425,7 @@ bool NativeEmmcBlock::start(IOService *provider)
   }
   online = true;
   registerService();
+  __atomic_fetch_add(&native_emmc_blocks_published, 1, __ATOMIC_RELAXED);
   return true;
 }
 
@@ -459,8 +470,12 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
       break;
     }
     done += n;
+    __atomic_fetch_add(&native_emmc_block_reads, 1, __ATOMIC_RELAXED);
   }
   IOLockUnlock(windowLock);
+  if (result != kIOReturnSuccess) {
+    __atomic_fetch_add(&native_emmc_block_failures, 1, __ATOMIC_RELAXED);
+  }
 
   completion->action(completion->target, completion->parameter, result, done * 512);
   return kIOReturnSuccess;
@@ -499,6 +514,61 @@ static unsigned gPublicationOrder[4];
 static unsigned gPublicationCount;
 static NativeEmmc *gPendingProvider;
 
+static void reportMedia(unsigned delay)
+{
+  IOSleep(delay * 1000);
+  char text[2200];
+  int used = snprintf(text, sizeof(text),
+                      "NATIVE_EMMC media report published=%u reads=%llu failures=%llu\n",
+                      native_emmc_blocks_published,
+                      (unsigned long long)native_emmc_block_reads,
+                      (unsigned long long)native_emmc_block_failures);
+  for (unsigned index = 0; index < gWindowCount; ++index) {
+    uint8_t sector[1024] = {};
+    uint32_t failure = 0;
+    if (gControllerLock) {
+      IOLockLock(gControllerLock);
+    }
+    bool ok = readBlocks(gControllerBase, gWindowLba[index], 2, sector, &failure);
+    if (gControllerLock) {
+      IOLockUnlock(gControllerLock);
+    }
+    used += snprintf(text + used, sizeof(text) - used,
+                     "window %u lba=%llu bytes=%llu read=%u failure=%u "
+                     "first=%02x%02x%02x%02x gpt=%02x%02x%02x%02x\n",
+                     index, (unsigned long long)gWindowLba[index],
+                     (unsigned long long)gWindowBytes[index], ok ? 1U : 0U, failure,
+                     sector[0], sector[1], sector[2], sector[3],
+                     sector[512], sector[513], sector[514], sector[515]);
+  }
+  OSDictionary *matching = IOService::serviceMatching("IOMedia");
+  OSIterator *iterator = matching ? IOService::getMatchingServices(matching) : nullptr;
+  unsigned count = 0;
+  while (iterator && used < int(sizeof(text)) - 200) {
+    IOService *media = OSDynamicCast(IOService, iterator->getNextObject());
+    if (!media) {
+      break;
+    }
+    OSString *uuid = OSDynamicCast(OSString, media->getProperty("UUID"));
+    OSString *bsd = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
+    OSString *content = OSDynamicCast(OSString, media->getProperty("Content"));
+    OSNumber *size = OSDynamicCast(OSNumber, media->getProperty("Size"));
+    bool whole = false;
+    OSBoolean *wholeProperty = OSDynamicCast(OSBoolean, media->getProperty("Whole"));
+    if (wholeProperty) {
+      whole = wholeProperty->isTrue();
+    }
+    used += snprintf(text + used, sizeof(text) - used, "media %u %s %s size=%llx whole=%u uuid=%s\n",
+                     count++, bsd ? bsd->getCStringNoCopy() : "-",
+                     content ? content->getCStringNoCopy() : "-",
+                     size ? size->unsigned64BitValue() : 0ULL, whole ? 1U : 0U,
+                     uuid ? uuid->getCStringNoCopy() : "-");
+  }
+  OSSafeReleaseNULL(iterator);
+  OSSafeReleaseNULL(matching);
+  panic("%s", text);
+}
+
 static void publishThread(void *, wait_result_t)
 {
   for (unsigned position = 0; position < gPublicationCount; ++position) {
@@ -508,6 +578,13 @@ static void publishThread(void *, wait_result_t)
       panic("NATIVE_EMMC window start failed: %s", device->windowLabel());
     }
     IOLog("NativeEmmc: published %s\n", device->windowLabel());
+  }
+  unsigned media = 0;
+  PE_parse_boot_argn("native-emmc-media", &media, sizeof(media));
+  if (media) {
+    unsigned delay = 2;
+    PE_parse_boot_argn("native-emmc-media-delay", &delay, sizeof(delay));
+    reportMedia(delay);
   }
   gPendingProvider->release();
 }
@@ -555,6 +632,7 @@ bool NativeEmmc::startRoot(IOService *provider)
     panic("NATIVE_EMMC controller lock allocation failed");
   }
   gControllerBase = fBase;
+  gWindowCount = layout->windows;
   gPendingProvider = this;
   for (unsigned index = 0; index < layout->windows; ++index) {
     NativeEmmcBlock *device = OSTypeAlloc(NativeEmmcBlock);
@@ -565,6 +643,8 @@ bool NativeEmmc::startRoot(IOService *provider)
       panic("NATIVE_EMMC window configure failed: %s", layout->window[index].name);
     }
     gPendingDevice[index] = device;
+    gWindowLba[index] = lba;
+    gWindowBytes[index] = layout->window[index].size;
   }
   IOFree(layout, sizeof(EmmcLayout));
 
