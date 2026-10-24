@@ -1,0 +1,28 @@
+# NativeEmmc
+
+Native XNU storage support for the MediaTek MT6768 MSDC controller, used by the
+Xiaomi Redmi Note 9 (merlinx) UniXNU port.
+
+The driver is intentionally developed in small, observable stages:
+
+1. `native-emmc-probe=1`: map the controller UEFI left running and panic with
+   its register state.
+2. `native-emmc-probe=2`: issue one read-only `CMD17` for the first block of
+   the iPadOS userdata partition and panic with the first 16 bytes. A successful
+   read starts with `SHNGROOT`.
+3. Publish the OS and SystemOS windows through the same root-layout/root-publication
+   contract used by NativeUfs.
+
+The probe does not reset, initialize, tune or write the controller or card. It
+depends on the state left by the platform UEFI firmware. No Apple binaries or
+other proprietary artifacts belong in this repository.
+
+## Integration
+
+The UniXNU device repository includes this repository as
+`drivers/NativeEmmc`, builds it with `scripts/build-arm-driver.py NativeEmmc`,
+and links `libNativeEmmc.a` when `CONFIG_XNU_NATIVE_EMMC=y`.
+
+## License
+
+BSD-2-Clause-Patent. See [LICENSE](LICENSE).
