@@ -401,6 +401,7 @@ class NativeEmmcBlock : public IOBlockStorageDevice {
 public:
   const char *windowLabel() const { return label; }
   bool isRootWindow() const { return !strcmp(label, "OS"); }
+  bool isTrustedWindow() const { return isRootWindow() || !strcmp(label, "SystemOS"); }
   bool isOnline() const { return online; }
   bool configure(const char *name, uint64_t lba, uint64_t size);
   bool start(IOService *provider) override;
@@ -433,9 +434,116 @@ public:
 
 OSDefineMetaClassAndStructors(NativeEmmcBlock, IOBlockStorageDevice)
 
+static char native_emmc_uuid_fold(char value)
+{
+  return value >= 'a' && value <= 'z' ? value - ('a' - 'A') : value;
+}
+
+static bool native_emmc_uuid_equals(const char *left, const char *right)
+{
+  if (!left || !right) {
+    return false;
+  }
+  while (*left && *right) {
+    if (native_emmc_uuid_fold(*left++) != native_emmc_uuid_fold(*right++)) {
+      return false;
+    }
+  }
+  return !*left && !*right;
+}
+
+static const char *native_emmc_window_for_uuid(const char *uuid)
+{
+  if (native_emmc_uuid_equals(uuid, "04769D26-2CA0-4825-B443-E2E5F88300F2")) {
+    return "OS";
+  }
+  if (native_emmc_uuid_equals(uuid, "8846FE78-2910-4297-AF97-D59BB6F8FC16")) {
+    return "SystemOS";
+  }
+  return nullptr;
+}
+
+extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *device, char *path, size_t size)
+{
+  if (!uuid || !device || !path || size < 6 || strlen(uuid) != 36) {
+    return 0;
+  }
+  const char *expected = native_emmc_window_for_uuid(uuid);
+  if (!expected) {
+    return 0;
+  }
+  *device = NODEV;
+  path[0] = 0;
+  OSDictionary *matching = IOService::serviceMatching("IOMedia");
+  OSDictionary *properties = OSDictionary::withCapacity(1);
+  OSString *wanted = OSString::withCString(uuid);
+  if (!matching || !properties || !wanted) {
+    OSSafeReleaseNULL(wanted);
+    OSSafeReleaseNULL(properties);
+    OSSafeReleaseNULL(matching);
+    return 0;
+  }
+  bool prepared = properties->setObject("UUID", wanted) &&
+                  matching->setObject("IOPropertyMatch", properties);
+  wanted->release();
+  properties->release();
+  if (!prepared) {
+    matching->release();
+    return 0;
+  }
+  OSIterator *iterator = IOService::getMatchingServices(matching);
+  matching->release();
+  if (!iterator) {
+    return 0;
+  }
+  bool authenticated = false;
+  unsigned matches = 0;
+  dev_t candidate = NODEV;
+  char candidatePath[64] = {};
+  while (OSObject *object = iterator->getNextObject()) {
+    IOService *media = OSDynamicCast(IOService, object);
+    if (!media) {
+      continue;
+    }
+    if (++matches != 1) {
+      authenticated = false;
+      break;
+    }
+    OSString *identity = OSDynamicCast(OSString, media->getProperty("UUID"));
+    OSString *name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
+    OSNumber *majorNumber = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMajorKey));
+    OSNumber *minorNumber = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMinorKey));
+    if (!identity || !native_emmc_uuid_equals(identity->getCStringNoCopy(), uuid) || !name || !majorNumber ||
+        !minorNumber || !name->getLength() || name->getLength() >= sizeof(candidatePath) - 6 ||
+        name->getLength() >= size - 6 || majorNumber->unsigned64BitValue() > 255 ||
+        minorNumber->unsigned64BitValue() > 0xffffff) {
+      continue;
+    }
+    for (IOService *provider = media; provider; provider = provider->getProvider()) {
+      NativeEmmcBlock *block = OSDynamicCast(NativeEmmcBlock, provider);
+      if (!block) {
+        continue;
+      }
+      authenticated = block->isOnline() && !strcmp(block->windowLabel(), expected);
+      if (authenticated) {
+        candidate = static_cast<dev_t>(makedev(majorNumber->unsigned32BitValue(),
+                                               minorNumber->unsigned32BitValue()));
+        snprintf(candidatePath, sizeof(candidatePath), "/dev/%s", name->getCStringNoCopy());
+      }
+      break;
+    }
+  }
+  iterator->release();
+  if (!authenticated || matches != 1) {
+    return 0;
+  }
+  *device = candidate;
+  strlcpy(path, candidatePath, size);
+  return 1;
+}
+
 // The offline OS image cannot satisfy Apple's per-device root seal. Accept the root only
-// when it was mounted from the read-only OS window this driver published. The root media
-// UUID is already the one the device tree asked XNU to match.
+// when it was mounted from one of the read-only target windows this driver published.
 extern "C" int native_verified_block_root_authorized(dev_t device)
 {
   unsigned root = 0;
@@ -477,15 +585,10 @@ extern "C" int native_verified_block_root_authorized(dev_t device)
       authorized = false;
       break;
     }
-    OSString *uuid = OSDynamicCast(OSString, media->getProperty("UUID"));
-    if (uuid && (uuid->getLength() != 36 ||
-        strcmp(uuid->getCStringNoCopy(), "04769D26-2CA0-4825-B443-E2E5F88300F2"))) {
-      continue;
-    }
     for (IOService *provider = media; provider; provider = provider->getProvider()) {
       NativeEmmcBlock *block = OSDynamicCast(NativeEmmcBlock, provider);
       if (block) {
-        authorized = block->isRootWindow() && block->isOnline();
+        authorized = block->isTrustedWindow() && block->isOnline();
         break;
       }
     }
