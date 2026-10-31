@@ -19,9 +19,13 @@ other proprietary artifacts belong in this repository.
 
 ## Integration
 
-The UniXNU device repository includes this repository as
+The UniXNU-merlinx repository includes this repository as
 `drivers/NativeEmmc`, builds it with `scripts/build-arm-driver.py NativeEmmc`,
 and links `libNativeEmmc.a` when `CONFIG_XNU_NATIVE_EMMC=y`.
+
+# Documentation
+
+Webpage at [https://unixnu.com/drivers/community-native-emmc](https://unixnu.com/drivers/community-native-emmc)
 
 ## License
 
