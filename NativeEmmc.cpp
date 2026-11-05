@@ -76,9 +76,14 @@ constexpr uint32_t SDC_CMD_STOP_CMD = 1U << 14;
 constexpr uint32_t SDC_CMD_BLK_SIZE_SHIFT = 16;
 constexpr uint32_t SDC_STS_BUSY = 1U << 0;
 
+// JEDEC eMMC R1 response error bits (Linux include/linux/mmc/mmc.h).
+constexpr uint32_t kR1ErrorMask = 0xFDF9A080U;
+
 constexpr uint32_t kBlockSize = 512;
-constexpr uint32_t kTransferBlocks = 128;
+constexpr uint32_t kTransferBlocks = 512;
 constexpr uint32_t kTransferBytes = kTransferBlocks * kBlockSize;
+constexpr unsigned kSpinPolls = 128;
+constexpr unsigned kMaxPolls = 200000;
 // p45 starts at 20332544 512-byte sectors in the eMMC user area. The root
 // manifest is at the beginning of the iPadOS userdata image.
 constexpr uint64_t kUserdataLba = 20332544ULL;
@@ -92,6 +97,15 @@ static inline uint32_t read32(uintptr_t base, uint32_t offset)
 static inline void write32(uintptr_t base, uint32_t offset, uint32_t value)
 {
   *reinterpret_cast<volatile uint32_t *>(base + offset) = value;
+}
+
+static inline void pollPause(unsigned iteration)
+{
+  if (iteration < kSpinPolls) {
+    __asm__ volatile("yield" ::: "memory");
+  } else {
+    IODelay(1);
+  }
 }
 
 static uintptr_t mapPhys(uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
@@ -132,12 +146,12 @@ static Registers snapshot(uintptr_t base)
 
 static bool waitCommand(uintptr_t base, uint32_t *status)
 {
-  for (unsigned i = 0; i < 200000; i++) {
+  for (unsigned i = 0; i < kMaxPolls; i++) {
     *status = read32(base, MSDC_INT);
     if (*status & (MSDC_INT_CMDRDY | MSDC_INT_ERROR)) {
       return true;
     }
-    IODelay(1);
+    pollPause(i);
   }
   return false;
 }
@@ -151,41 +165,42 @@ static void clearStatus(uintptr_t base, uint32_t bits)
 
 static bool waitNotBusy(uintptr_t base, uint32_t *failure)
 {
-  for (unsigned i = 0; i < 200000; i++) {
+  for (unsigned i = 0; i < kMaxPolls; i++) {
     if ((read32(base, SDC_STS) & SDC_STS_BUSY) == 0) {
       return true;
     }
-    IODelay(1);
+    pollPause(i);
   }
-  *failure = 1;
+  if (failure) {
+    *failure = 1;
+  }
   return false;
 }
 
-// Read blocks with one CMD18. The controller is not reinitialized: this is the
-// same PIO path UEFI used, with interrupts masked and completion polled.
-static void stopTransfer(uintptr_t base)
+// Issue CMD12 to terminate an open-ended or failed multi-block transfer, clear
+// any residual FIFO state, and wait for the card/controller busy state to drop.
+static bool stopTransfer(uintptr_t base)
 {
   uint32_t status = 0;
-  for (unsigned i = 0; i < 200000; i++) {
-    if ((read32(base, SDC_STS) & SDC_STS_BUSY) == 0) {
+  for (unsigned i = 0; i < kMaxPolls; i++) {
+    if ((read32(base, SDC_STS) & (SDC_STS_BUSY << 1)) == 0) {
       break;
     }
-    IODelay(1);
+    pollPause(i);
   }
   write32(base, MSDC_INTEN, 0);
   clearStatus(base, 0xffffffffU);
   write32(base, SDC_ARG, 0);
   write32(base, SDC_CMD, 12U | (7U << SDC_CMD_RSP_TYPE_SHIFT) | SDC_CMD_STOP_CMD);
-  waitCommand(base, &status);
+  bool cmdOk = waitCommand(base, &status) && (status & MSDC_INT_ERROR) == 0;
   clearStatus(base, status & (MSDC_INT_CMDRDY | MSDC_INT_ERROR));
-  for (unsigned i = 0; i < 200000; i++) {
-    if ((read32(base, SDC_STS) & SDC_STS_BUSY) == 0) {
-      break;
-    }
-    IODelay(1);
-  }
+  write32(base, MSDC_FIFOCS, MSDC_FIFOCS_CLR);
+  bool busyOk = waitNotBusy(base, nullptr);
+  return cmdOk && busyOk;
 }
 
+// Read blocks via PIO (CMD17 for 1 block, CMD18 + CMD12 for multiple blocks),
+// modeled on Linux drivers/mmc/host/mtk-sd.c msdc_pio_read().
 static bool readBlocks(uintptr_t base, uint64_t lba, uint32_t blocks, uint8_t *out, uint32_t *failure)
 {
   uint32_t status = 0;
@@ -215,50 +230,102 @@ static bool readBlocks(uintptr_t base, uint64_t lba, uint32_t blocks, uint8_t *o
           (kBlockSize << SDC_CMD_BLK_SIZE_SHIFT));
 
   if (!waitCommand(base, &status)) {
+    if (blocks > 1) {
+      (void)stopTransfer(base);
+    }
     *failure = 2;
     return false;
   }
   if (status & MSDC_INT_ERROR) {
+    clearStatus(base, status & (MSDC_INT_CMDRDY | MSDC_INT_ERROR));
+    if (blocks > 1) {
+      (void)stopTransfer(base);
+    }
     *failure = 3;
     return false;
   }
   clearStatus(base, MSDC_INT_CMDRDY);
 
+  // Verify the card's R1 status word in SDC_RESP0 before entering the data phase.
+  if ((read32(base, SDC_RESP0) & kR1ErrorMask) != 0) {
+    if (blocks > 1) {
+      (void)stopTransfer(base);
+    }
+    *failure = 7;
+    return false;
+  }
+
   uint32_t got = 0;
   unsigned idle = 0;
   while (got < total) {
+    uint32_t available = read32(base, MSDC_FIFOCS) & MSDC_FIFOCS_RX_MASK;
+    if (available >= 4) {
+      do {
+        while (available >= 4 && got + 4 <= total) {
+          uint32_t word = read32(base, MSDC_RXDATA);
+          __builtin_memcpy(out + got, &word, sizeof(word));
+          got += 4;
+          available -= 4;
+        }
+        if (got >= total) {
+          break;
+        }
+        available = read32(base, MSDC_FIFOCS) & MSDC_FIFOCS_RX_MASK;
+      } while (available >= 4);
+      idle = 0;
+      continue;
+    }
+
     status = read32(base, MSDC_INT);
     if (status & MSDC_INT_ERROR) {
+      clearStatus(base, status & (MSDC_INT_XFER_COMPL | MSDC_INT_ERROR));
+      if (blocks > 1) {
+        (void)stopTransfer(base);
+      }
       *failure = 4;
       return false;
     }
-    uint32_t available = read32(base, MSDC_FIFOCS) & MSDC_FIFOCS_RX_MASK;
-    uint32_t before = got;
-    while (available >= 4 && got + 4 <= total) {
-      uint32_t word = read32(base, MSDC_RXDATA);
-      out[got + 0] = static_cast<uint8_t>(word);
-      out[got + 1] = static_cast<uint8_t>(word >> 8);
-      out[got + 2] = static_cast<uint8_t>(word >> 16);
-      out[got + 3] = static_cast<uint8_t>(word >> 24);
-      got += 4;
-      available -= 4;
-    }
-    if ((status & MSDC_INT_XFER_COMPL) && got == total) {
-      clearStatus(base, status & MSDC_INT_XFER_COMPL);
-      break;
-    }
-    if (got != before) {
-      idle = 0;
-    } else if (++idle > 200000) {
+    if (++idle > kMaxPolls) {
+      if (blocks > 1) {
+        (void)stopTransfer(base);
+      }
       *failure = 5;
       return false;
     }
-    IODelay(1);
+    pollPause(idle);
   }
 
-  clearStatus(base, status & (MSDC_INT_XFER_COMPL | MSDC_INT_ERROR));
-  if (blocks > 1) {
-    stopTransfer(base);
+  // Require an explicit transfer-complete indication without controller errors
+  // even after all expected bytes have been drained from the RX FIFO.
+  bool completed = false;
+  for (unsigned i = 0; i < kMaxPolls; i++) {
+    status = read32(base, MSDC_INT);
+    if (status & MSDC_INT_ERROR) {
+      clearStatus(base, status & (MSDC_INT_XFER_COMPL | MSDC_INT_ERROR));
+      if (blocks > 1) {
+        (void)stopTransfer(base);
+      }
+      *failure = 4;
+      return false;
+    }
+    if (status & MSDC_INT_XFER_COMPL) {
+      clearStatus(base, MSDC_INT_XFER_COMPL);
+      completed = true;
+      break;
+    }
+    pollPause(i);
+  }
+  if (!completed) {
+    if (blocks > 1) {
+      (void)stopTransfer(base);
+    }
+    *failure = 5;
+    return false;
+  }
+
+  if (blocks > 1 && !stopTransfer(base)) {
+    *failure = 6;
+    return false;
   }
   *failure = 0;
   return true;
@@ -585,10 +652,13 @@ extern "C" int native_verified_block_root_authorized(dev_t device)
       authorized = false;
       break;
     }
+    OSString *identity = OSDynamicCast(OSString, media->getProperty("UUID"));
+    const char *expectedWindow = identity ? native_emmc_window_for_uuid(identity->getCStringNoCopy()) : nullptr;
     for (IOService *provider = media; provider; provider = provider->getProvider()) {
       NativeEmmcBlock *block = OSDynamicCast(NativeEmmcBlock, provider);
       if (block) {
-        authorized = block->isTrustedWindow() && block->isOnline();
+        authorized = block->isTrustedWindow() && block->isOnline() &&
+                     (!expectedWindow || !strcmp(block->windowLabel(), expectedWindow));
         break;
       }
     }
@@ -654,14 +724,9 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
       result = kIOReturnIOError;
       break;
     }
-    for (uint32_t index = 0; index < n; index++) {
-      uint64_t offset = (done + index) * 512;
-      if (buffer->writeBytes(offset, bounce + index * 512, 512) != 512) {
-        result = kIOReturnIOError;
-        break;
-      }
-    }
-    if (result != kIOReturnSuccess) {
+    const IOByteCount chunkBytes = static_cast<IOByteCount>(n) * kBlockSize;
+    if (buffer->writeBytes(done * kBlockSize, bounce, chunkBytes) != chunkBytes) {
+      result = kIOReturnIOError;
       break;
     }
     done += n;
