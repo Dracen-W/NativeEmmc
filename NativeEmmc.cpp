@@ -80,9 +80,9 @@ constexpr uint32_t SDC_STS_BUSY = 1U << 0;
 constexpr uint32_t kR1ErrorMask = 0xFDF9A080U;
 
 constexpr uint32_t kBlockSize = 512;
-constexpr uint32_t kTransferBlocks = 512;
+constexpr uint32_t kTransferBlocks = 2048;
 constexpr uint32_t kTransferBytes = kTransferBlocks * kBlockSize;
-constexpr unsigned kSpinPolls = 128;
+constexpr unsigned kSpinPolls = 4096;
 constexpr unsigned kMaxPolls = 200000;
 // p45 starts at 20332544 512-byte sectors in the eMMC user area. The root
 // manifest is at the beginning of the iPadOS userdata image.
@@ -101,7 +101,7 @@ static inline void write32(uintptr_t base, uint32_t offset, uint32_t value)
 
 static inline void pollPause(unsigned iteration)
 {
-  if (iteration < kSpinPolls) {
+  if ((iteration & (kSpinPolls - 1U)) != 0U) {
     __asm__ volatile("yield" ::: "memory");
   } else {
     IODelay(1);
@@ -183,7 +183,7 @@ static bool stopTransfer(uintptr_t base)
 {
   uint32_t status = 0;
   for (unsigned i = 0; i < kMaxPolls; i++) {
-    if ((read32(base, SDC_STS) & (SDC_STS_BUSY << 1)) == 0) {
+    if ((read32(base, SDC_STS) & (SDC_STS_BUSY | (SDC_STS_BUSY << 1))) == 0) {
       break;
     }
     pollPause(i);
@@ -215,6 +215,8 @@ static bool readBlocks(uintptr_t base, uint64_t lba, uint32_t blocks, uint8_t *o
   write32(base, MSDC_INTEN, 0);
   clearStatus(base, 0xffffffffU);
   write32(base, MSDC_FIFOCS, MSDC_FIFOCS_CLR);
+  for (unsigned clrSpin = 0; clrSpin < 100000U && (read32(base, MSDC_FIFOCS) & MSDC_FIFOCS_CLR); ++clrSpin) {
+  }
   write32(base, MSDC_CFG, read32(base, MSDC_CFG) | MSDC_CFG_MODE | MSDC_CFG_PIO);
 
   if (!waitNotBusy(base, failure)) {
