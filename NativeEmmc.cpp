@@ -23,6 +23,7 @@
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
 
+extern "C" __attribute__((weak)) void native_gop_text(unsigned int line, const char *text);
 extern "C" volatile uint32_t native_emmc_probe_calls;
 extern "C" volatile uint32_t native_emmc_matched;
 extern "C" volatile uint32_t native_emmc_probe_requested;
@@ -58,6 +59,7 @@ constexpr uint32_t SDC_CSTS = 0x058;
 constexpr uint32_t EMMC_CFG0 = 0x070;
 
 constexpr uint32_t MSDC_CFG_MODE = 1U << 0;
+constexpr uint32_t MSDC_CFG_RST = 1U << 2;
 constexpr uint32_t MSDC_CFG_PIO = 1U << 3;
 constexpr uint32_t MSDC_INT_CMDRDY = 1U << 8;
 constexpr uint32_t MSDC_INT_CMDTMO = 1U << 9;
@@ -83,7 +85,7 @@ constexpr uint32_t kBlockSize = 512;
 constexpr uint32_t kTransferBlocks = 2048;
 constexpr uint32_t kTransferBytes = kTransferBlocks * kBlockSize;
 constexpr unsigned kSpinPolls = 4096;
-constexpr unsigned kMaxPolls = 200000;
+constexpr unsigned kMaxPolls = 1000000;
 // p45 starts at 20332544 512-byte sectors in the eMMC user area. The root
 // manifest is at the beginning of the iPadOS userdata image.
 constexpr uint64_t kUserdataLba = 20332544ULL;
@@ -101,11 +103,26 @@ static inline void write32(uintptr_t base, uint32_t offset, uint32_t value)
 
 static inline void pollPause(unsigned iteration)
 {
-  if ((iteration & (kSpinPolls - 1U)) != 0U) {
+  if (iteration < kSpinPolls) {
     __asm__ volatile("yield" ::: "memory");
+  } else if ((iteration & 63U) == 0U) {
+    IODelay(iteration < 65536U ? 5 : 50);
   } else {
+    __asm__ volatile("yield" ::: "memory");
+  }
+}
+
+static void resetController(uintptr_t base)
+{
+  write32(base, MSDC_CFG, read32(base, MSDC_CFG) | MSDC_CFG_RST);
+  for (unsigned i = 0; i < 100000U && (read32(base, MSDC_CFG) & MSDC_CFG_RST); ++i) {
     IODelay(1);
   }
+  write32(base, MSDC_FIFOCS, MSDC_FIFOCS_CLR);
+  for (unsigned i = 0; i < 100000U && (read32(base, MSDC_FIFOCS) & MSDC_FIFOCS_CLR); ++i) {
+    IODelay(1);
+  }
+  write32(base, MSDC_INT, 0xffffffffU);
 }
 
 static uintptr_t mapPhys(uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
@@ -719,8 +736,24 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
       n = kTransferBlocks;
     }
     uint32_t failure = 0;
+    bool ok = false;
     IOLockLock(gControllerLock);
-    bool ok = readBlocks(gControllerBase, absoluteLba + block + done, n, bounce, &failure);
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+      failure = 0;
+      ok = readBlocks(gControllerBase, absoluteLba + block + done, n, bounce, &failure);
+      if (ok) {
+        break;
+      }
+      if (native_gop_text) {
+        char errLine[64];
+        snprintf(errLine, sizeof(errLine), "EMMC RD ERR f%u lba%llx n%u try%u",
+                 failure, (unsigned long long)(absoluteLba + block + done), n, attempt + 1);
+        native_gop_text(13, errLine);
+      }
+      (void)stopTransfer(gControllerBase);
+      resetController(gControllerBase);
+      IODelay(1000 * (attempt + 1));
+    }
     IOLockUnlock(gControllerLock);
     if (!ok) {
       result = kIOReturnIOError;
