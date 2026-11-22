@@ -81,6 +81,9 @@ constexpr uint32_t SDC_CMD_MULTIPLE_BLK = 1U << 12;
 constexpr uint32_t SDC_CMD_STOP_CMD = 1U << 14;
 constexpr uint32_t SDC_CMD_BLK_SIZE_SHIFT = 16;
 constexpr uint32_t SDC_STS_BUSY = 1U << 0;
+constexpr uint32_t MSDC_PS_DAT0 = 1U << 16;
+constexpr uint32_t SDC_CFG_BUSWIDTH_SHIFT = 16;
+constexpr uint32_t SDC_CFG_BUSWIDTH_MASK = 3U << SDC_CFG_BUSWIDTH_SHIFT;
 
 // JEDEC eMMC R1 response error bits (Linux include/linux/mmc/mmc.h).
 constexpr uint32_t kR1ErrorMask = 0xFDF9A080U;
@@ -373,6 +376,88 @@ static bool readBlocks(uintptr_t base, uint64_t lba, uint32_t blocks, uint8_t *o
   }
   *failure = 0;
   return true;
+}
+
+static bool sendSwitch(uintptr_t base, uint8_t index, uint8_t value, uint32_t *respOut)
+{
+  uint32_t status = 0;
+  if (!waitNotBusy(base, nullptr)) {
+    return false;
+  }
+  write32(base, MSDC_INTEN, 0);
+  clearStatus(base, 0xffffffffU);
+  uint32_t arg = (3U << 24) | (static_cast<uint32_t>(index) << 16) | (static_cast<uint32_t>(value) << 8);
+  write32(base, SDC_ARG, arg);
+  write32(base, SDC_CMD, 6U | (7U << SDC_CMD_RSP_TYPE_SHIFT));
+  if (!waitCommand(base, &status)) {
+    return false;
+  }
+  clearStatus(base, status & (MSDC_INT_CMDRDY | MSDC_INT_ERROR));
+  if (status & MSDC_INT_ERROR) {
+    return false;
+  }
+  uint32_t resp = read32(base, SDC_RESP0);
+  if (respOut) {
+    *respOut = resp;
+  }
+  if ((resp & kR1ErrorMask) != 0) {
+    return false;
+  }
+  if (!waitNotBusy(base, nullptr)) {
+    return false;
+  }
+  for (unsigned i = 0; i < 50000U; ++i) {
+    if ((read32(base, MSDC_PS) & MSDC_PS_DAT0) != 0) {
+      break;
+    }
+    IODelay(1);
+  }
+  IODelay(1000);
+  return true;
+}
+
+static void setControllerBusWidth(uintptr_t base, uint32_t bwCode)
+{
+  uint32_t sc = read32(base, SDC_CFG);
+  sc = (sc & ~SDC_CFG_BUSWIDTH_MASK) | ((bwCode & 3U) << SDC_CFG_BUSWIDTH_SHIFT);
+  write32(base, SDC_CFG, sc);
+  IODelay(100);
+}
+
+// Upgrade eMMC bus width from UEFI's 1-bit mode to 8-bit SDR (with 4-bit and 1-bit
+// automatic fallback verified bit-for-bit against sector kUserdataLba).
+static uint32_t upgradeBusWidth(uintptr_t base, uint32_t *respOut)
+{
+  uint32_t curCode = (read32(base, SDC_CFG) >> SDC_CFG_BUSWIDTH_SHIFT) & 3U;
+  if (curCode == 2U) {
+    return 8U;
+  }
+  uint8_t refBlock[kBlockSize] = {};
+  uint8_t testBlock[kBlockSize] = {};
+  uint32_t fail = 0;
+  if (!readBlocks(base, kUserdataLba, 1, refBlock, &fail)) {
+    return curCode == 1U ? 4U : 1U;
+  }
+
+  // Try 8-bit SDR (EXT_CSD[183]=2, SDC_CFG bw=2), then 4-bit SDR (EXT_CSD[183]=1, bw=1).
+  const uint8_t candidates[2] = { 2, 1 };
+  for (unsigned c = 0; c < 2; ++c) {
+    uint8_t code = candidates[c];
+    if (sendSwitch(base, 183, code, respOut)) {
+      setControllerBusWidth(base, code);
+      fail = 0;
+      if (readBlocks(base, kUserdataLba, 1, testBlock, &fail) &&
+          memcmp(refBlock, testBlock, kBlockSize) == 0) {
+        return code == 2 ? 8U : 4U;
+      }
+      resetController(base);
+    }
+  }
+
+  // Fallback to 1-bit SDR so boot is always preserved.
+  (void)sendSwitch(base, 183, 0, nullptr);
+  setControllerBusWidth(base, 0);
+  return 1U;
 }
 
 static uint32_t le32(const uint8_t *at)
@@ -941,11 +1026,13 @@ bool NativeEmmc::startRoot(IOService *provider)
 {
   write32(fBase, MSDC_CFG, read32(fBase, MSDC_CFG) | MSDC_CFG_MODE | MSDC_CFG_PIO);
   {
+    uint32_t bwBeforeBits = (read32(fBase, SDC_CFG) >> SDC_CFG_BUSWIDTH_SHIFT) & 3U;
+    uint32_t bwBefore = (bwBeforeBits == 2U) ? 8U : ((bwBeforeBits == 1U) ? 4U : 1U);
+    uint32_t swResp = 0;
+    uint32_t busWidth = upgradeBusWidth(fBase, &swResp);
     Registers r = snapshot(fBase);
     uint32_t ckdiv = (r.cfg >> 8) & 0xfffU;
     uint32_t ckmod = (r.cfg >> 20) & 0x3U;
-    uint32_t bwBits = (r.sdcCfg >> 16) & 0x3U;
-    uint32_t busWidth = (bwBits == 2U) ? 8U : ((bwBits == 1U) ? 4U : 1U);
     uint32_t benchUs = 0;
     uint32_t benchKBs = 0;
     uint32_t benchFail = 0;
@@ -962,8 +1049,8 @@ bool NativeEmmc::startRoot(IOService *provider)
     }
     if (native_musb_log_printf) {
       native_musb_log_printf(
-          "[EMMC] cfg=%08x(ckmod=%u ckdiv=%u) sdccfg=%08x(bw=%u) emmc0=%08x top0=%08x | 1M_pio=%uus (%u.%u MB/s fail=%u)\n",
-          r.cfg, ckmod, ckdiv, r.sdcCfg, busWidth, r.emmcCfg0, read32(fTop, 0),
+          "[EMMC] cfg=%08x(ckmod=%u ckdiv=%u) sdccfg=%08x(bw=%u->%u sw=%08x) emmc0=%08x top0=%08x | 1M_pio=%uus (%u.%u MB/s fail=%u)\n",
+          r.cfg, ckmod, ckdiv, r.sdcCfg, bwBefore, busWidth, swResp, r.emmcCfg0, read32(fTop, 0),
           benchUs, benchKBs / 1000U, (benchKBs % 1000U) / 100U, benchFail);
     }
     IOLog("NativeEmmc: cfg=%08x ckmod=%u ckdiv=%u bw=%u 1M_pio=%uus (%u.%u MB/s fail=%u)\n",
