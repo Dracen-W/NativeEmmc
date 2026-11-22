@@ -9,6 +9,8 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 #include <IOKit/IOBSD.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <sys/param.h>
@@ -61,6 +63,23 @@ constexpr uint32_t SDC_RESP0 = 0x040;
 constexpr uint32_t SDC_BLK_NUM = 0x050;
 constexpr uint32_t SDC_CSTS = 0x058;
 constexpr uint32_t EMMC_CFG0 = 0x070;
+constexpr uint32_t MSDC_DMA_SA = 0x090;
+constexpr uint32_t MSDC_DMA_CTRL = 0x098;
+constexpr uint32_t MSDC_DMA_CFG = 0x09c;
+constexpr uint32_t MSDC_DMA_LEN = 0x0a8;
+
+constexpr uint32_t MSDC_CFG_CKSTB = 1U << 7;
+constexpr uint32_t MSDC_CFG_CKMOD_SHIFT = 20;
+constexpr uint32_t MSDC_CFG_CKMOD_MASK = 3U << MSDC_CFG_CKMOD_SHIFT;
+
+constexpr uint32_t MSDC_DMA_CTRL_START = 1U << 0;
+constexpr uint32_t MSDC_DMA_CTRL_STOP = 1U << 1;
+constexpr uint32_t MSDC_DMA_CTRL_LASTBUF = 1U << 10;
+constexpr uint32_t MSDC_DMA_CTRL_BRUSTSZ_64B = 6U << 12;
+constexpr uint32_t MSDC_DMA_CFG_STS = 1U << 0;
+
+constexpr uint32_t kDmaMaxBlocks = 512; // 256 KiB physically contiguous <4 GiB buffer
+constexpr uint32_t kDmaMaxBytes = kDmaMaxBlocks * 512;
 
 constexpr uint32_t MSDC_CFG_MODE = 1U << 0;
 constexpr uint32_t MSDC_CFG_RST = 1U << 2;
@@ -138,7 +157,13 @@ static void resetController(uintptr_t base)
     IODelay(1);
   }
   write32(base, MSDC_INT, 0xffffffffU);
-  write32(base, MSDC_CFG, read32(base, MSDC_CFG) | MSDC_CFG_MODE | MSDC_CFG_PIO);
+  uint32_t cfg = read32(base, MSDC_CFG) | MSDC_CFG_MODE;
+  if (gUseDma) {
+    cfg &= ~MSDC_CFG_PIO;
+  } else {
+    cfg |= MSDC_CFG_PIO;
+  }
+  write32(base, MSDC_CFG, cfg);
 }
 
 static uintptr_t mapPhys(uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
@@ -460,6 +485,169 @@ static uint32_t upgradeBusWidth(uintptr_t base, uint32_t *respOut)
   return 1U;
 }
 
+static bool waitClockStable(uintptr_t base)
+{
+  for (unsigned i = 0; i < 100000U; ++i) {
+    if ((read32(base, MSDC_CFG) & MSDC_CFG_CKSTB) != 0) {
+      return true;
+    }
+    IODelay(1);
+  }
+  return false;
+}
+
+static bool setClockMode(uintptr_t base, uint32_t ckmod)
+{
+  uint32_t cfg = read32(base, MSDC_CFG);
+  cfg = (cfg & ~MSDC_CFG_CKMOD_MASK) | ((ckmod & 3U) << MSDC_CFG_CKMOD_SHIFT);
+  write32(base, MSDC_CFG, cfg);
+  return waitClockStable(base);
+}
+
+// Upgrade from 8-bit SDR50 (50 MB/s) to 8-bit DDR52 (100 MB/s) with bit-exact
+// verification and automatic fallback to 8-bit SDR50.
+static bool upgradeToDdr52(uintptr_t base, uint32_t *respOut)
+{
+  uint8_t refBuf[4096] = {};
+  uint8_t testBuf[4096] = {};
+  uint32_t fail = 0;
+  if (!readBlocks(base, kUserdataLba, 8, refBuf, &fail)) {
+    return false;
+  }
+  if (sendSwitch(base, 183, 6, respOut)) {
+    if (setClockMode(base, 2U)) {
+      fail = 0;
+      if (readBlocks(base, kUserdataLba, 8, testBuf, &fail) &&
+          memcmp(refBuf, testBuf, sizeof(refBuf)) == 0) {
+        return true;
+      }
+    }
+    resetController(base);
+  }
+  // Fallback cleanly to 8-bit SDR50
+  (void)setClockMode(base, 0U);
+  (void)sendSwitch(base, 183, 2, nullptr);
+  setControllerBusWidth(base, 2U);
+  resetController(base);
+  return false;
+}
+
+// Read blocks via MT6768 MSDC0 Basic DMA into a <4 GiB physically contiguous buffer.
+static bool readBlocksDma(uintptr_t base, uint64_t lba, uint32_t blocks,
+                          uint8_t *dmaVirt, uint64_t dmaPhys, uint32_t *failure)
+{
+  uint32_t status = 0;
+  uint32_t total = blocks * kBlockSize;
+
+  if (!blocks || !dmaVirt || !dmaPhys || lba > 0xffffffffULL ||
+      dmaPhys + total > 0x100000000ULL) {
+    *failure = 1;
+    return false;
+  }
+
+  write32(base, MSDC_INTEN, 0);
+  clearStatus(base, 0xffffffffU);
+  write32(base, MSDC_FIFOCS, MSDC_FIFOCS_CLR);
+  for (unsigned clrSpin = 0; clrSpin < 100000U && (read32(base, MSDC_FIFOCS) & MSDC_FIFOCS_CLR); ++clrSpin) {
+  }
+
+  if (!waitNotBusy(base, failure)) {
+    return false;
+  }
+
+  // Clean & invalidate CPU cache lines before device writes to DRAM.
+  flush_dcache64(dmaPhys, total, 1);
+  __asm__ volatile("dsb sy" ::: "memory");
+
+  write32(base, MSDC_DMA_SA, static_cast<uint32_t>(dmaPhys));
+  write32(base, MSDC_DMA_LEN, total);
+  write32(base, SDC_BLK_NUM, blocks);
+  write32(base, SDC_ARG, static_cast<uint32_t>(lba));
+
+  uint32_t command = blocks == 1 ? 17U : 18U;
+  uint32_t transfer = blocks == 1 ? SDC_CMD_SINGLE_BLK : SDC_CMD_MULTIPLE_BLK;
+  write32(base, SDC_CMD,
+          command | (1U << SDC_CMD_RSP_TYPE_SHIFT) | transfer |
+          (kBlockSize << SDC_CMD_BLK_SIZE_SHIFT));
+
+  if (!waitCommand(base, &status)) {
+    if (blocks > 1) {
+      (void)stopTransfer(base);
+    }
+    *failure = 2;
+    return false;
+  }
+  if (status & MSDC_INT_ERROR) {
+    clearStatus(base, status & (MSDC_INT_CMDRDY | MSDC_INT_ERROR));
+    if (blocks > 1) {
+      (void)stopTransfer(base);
+    }
+    *failure = 3;
+    return false;
+  }
+  clearStatus(base, MSDC_INT_CMDRDY);
+
+  if ((read32(base, SDC_RESP0) & kR1ErrorMask) != 0) {
+    if (blocks > 1) {
+      (void)stopTransfer(base);
+    }
+    *failure = 7;
+    return false;
+  }
+
+  // Start Basic DMA (64-byte burst, LASTBUF=1).
+  write32(base, MSDC_DMA_CTRL,
+          MSDC_DMA_CTRL_BRUSTSZ_64B | MSDC_DMA_CTRL_LASTBUF | MSDC_DMA_CTRL_START);
+
+  bool completed = false;
+  for (unsigned i = 0; i < kMaxPolls; ++i) {
+    status = read32(base, MSDC_INT);
+    if (status & MSDC_INT_ERROR) {
+      clearStatus(base, status & (MSDC_INT_XFER_COMPL | MSDC_INT_ERROR));
+      write32(base, MSDC_DMA_CTRL, MSDC_DMA_CTRL_STOP);
+      for (unsigned s = 0; s < 100000U && (read32(base, MSDC_DMA_CFG) & MSDC_DMA_CFG_STS); ++s) {
+        IODelay(1);
+      }
+      if (blocks > 1) {
+        (void)stopTransfer(base);
+      }
+      *failure = 4;
+      return false;
+    }
+    if ((status & MSDC_INT_XFER_COMPL) &&
+        (read32(base, MSDC_DMA_CFG) & MSDC_DMA_CFG_STS) == 0) {
+      clearStatus(base, MSDC_INT_XFER_COMPL);
+      completed = true;
+      break;
+    }
+    pollPause(i);
+  }
+  if (!completed) {
+    write32(base, MSDC_DMA_CTRL, MSDC_DMA_CTRL_STOP);
+    for (unsigned s = 0; s < 100000U && (read32(base, MSDC_DMA_CFG) & MSDC_DMA_CFG_STS); ++s) {
+      IODelay(1);
+    }
+    if (blocks > 1) {
+      (void)stopTransfer(base);
+    }
+    *failure = 5;
+    return false;
+  }
+
+  if (blocks > 1 && !stopTransfer(base)) {
+    *failure = 6;
+    return false;
+  }
+
+  // Invalidate CPU cache so reads observe the DMA-written DRAM contents.
+  __asm__ volatile("dsb sy" ::: "memory");
+  flush_dcache64(dmaPhys, total, 1);
+  __asm__ volatile("dsb sy" ::: "memory");
+
+  *failure = 0;
+  return true;
+}
+
 static uint32_t le32(const uint8_t *at)
 {
   return uint32_t(at[0]) | (uint32_t(at[1]) << 8) | (uint32_t(at[2]) << 16) | (uint32_t(at[3]) << 24);
@@ -583,6 +771,11 @@ static uintptr_t gControllerBase = 0;
 static uint64_t gWindowLba[4];
 static uint64_t gWindowBytes[4];
 static unsigned gWindowCount;
+static bool gUseDma = false;
+static IOBufferMemoryDescriptor *gDmaDesc = nullptr;
+static uint8_t *gDmaVirt = nullptr;
+static uint64_t gDmaPhys = 0;
+static uint32_t gDmaBlocks = 0;
 
 } // namespace
 
@@ -841,9 +1034,11 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
   uint64_t done = 0;
   IOLockLock(windowLock);
   while (done < count) {
+    const bool useDma = gUseDma && gDmaVirt && gDmaPhys && gDmaBlocks > 0;
+    uint32_t maxChunk = useDma ? gDmaBlocks : kTransferBlocks;
     uint32_t n = static_cast<uint32_t>(count - done);
-    if (n > kTransferBlocks) {
-      n = kTransferBlocks;
+    if (n > maxChunk) {
+      n = maxChunk;
     }
     uint32_t failure = 0;
     bool ok = false;
@@ -851,7 +1046,9 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
     IOLockLock(gControllerLock);
     for (unsigned attempt = 0; attempt < 4; ++attempt) {
       failure = 0;
-      ok = readBlocks(gControllerBase, absoluteLba + block + done, n, bounce, &failure);
+      ok = useDma
+               ? readBlocksDma(gControllerBase, absoluteLba + block + done, n, gDmaVirt, gDmaPhys, &failure)
+               : readBlocks(gControllerBase, absoluteLba + block + done, n, bounce, &failure);
       if (ok) {
         break;
       }
@@ -865,14 +1062,15 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
       resetController(gControllerBase);
       IODelay(1000 * (attempt + 1));
     }
+    const IOByteCount chunkBytes = static_cast<IOByteCount>(n) * kBlockSize;
+    bool copyOk = false;
+    if (ok) {
+      const void *srcBuf = useDma ? static_cast<const void *>(gDmaVirt) : static_cast<const void *>(bounce);
+      copyOk = (buffer->writeBytes(done * kBlockSize, srcBuf, chunkBytes) == chunkBytes);
+    }
     IOLockUnlock(gControllerLock);
     __atomic_fetch_add(&native_emmc_read_us_total, emmcNowUs() - t0, __ATOMIC_RELAXED);
-    if (!ok) {
-      result = kIOReturnIOError;
-      break;
-    }
-    const IOByteCount chunkBytes = static_cast<IOByteCount>(n) * kBlockSize;
-    if (buffer->writeBytes(done * kBlockSize, bounce, chunkBytes) != chunkBytes) {
+    if (!ok || !copyOk) {
       result = kIOReturnIOError;
       break;
     }
@@ -1029,32 +1227,101 @@ bool NativeEmmc::startRoot(IOService *provider)
     uint32_t bwBeforeBits = (read32(fBase, SDC_CFG) >> SDC_CFG_BUSWIDTH_SHIFT) & 3U;
     uint32_t bwBefore = (bwBeforeBits == 2U) ? 8U : ((bwBeforeBits == 1U) ? 4U : 1U);
     uint32_t swResp = 0;
+    uint32_t ddrResp = 0;
     uint32_t busWidth = upgradeBusWidth(fBase, &swResp);
-    Registers r = snapshot(fBase);
-    uint32_t ckdiv = (r.cfg >> 8) & 0xfffU;
-    uint32_t ckmod = (r.cfg >> 20) & 0x3U;
-    uint32_t benchUs = 0;
-    uint32_t benchKBs = 0;
-    uint32_t benchFail = 0;
+    bool ddrOk = (busWidth == 8U) ? upgradeToDdr52(fBase, &ddrResp) : false;
+
+    uint32_t pioUs = 0, pioKBs = 0, pioFail = 0;
+    uint8_t refHead[4096] = {};
+    bool haveRef = false;
     uint8_t *benchBuf = static_cast<uint8_t *>(IOMalloc(kTransferBytes));
     if (benchBuf) {
       uint64_t t0 = emmcNowUs();
-      bool ok = readBlocks(fBase, kUserdataLba, kTransferBlocks, benchBuf, &benchFail);
+      bool ok = readBlocks(fBase, kUserdataLba, kTransferBlocks, benchBuf, &pioFail);
       uint64_t dt = emmcNowUs() - t0;
-      benchUs = static_cast<uint32_t>(dt > 0xffffffffULL ? 0xffffffffULL : dt);
+      pioUs = static_cast<uint32_t>(dt > 0xffffffffULL ? 0xffffffffULL : dt);
       if (ok && dt > 0) {
-        benchKBs = static_cast<uint32_t>((static_cast<uint64_t>(kTransferBytes) * 1000ULL) / dt);
+        pioKBs = static_cast<uint32_t>((static_cast<uint64_t>(kTransferBytes) * 1000ULL) / dt);
+        memcpy(refHead, benchBuf, sizeof(refHead));
+        haveRef = true;
       }
       IOFree(benchBuf, kTransferBytes);
     }
+
+    // Attempt Basic DMA self-test using a <4 GiB physically contiguous bounce buffer.
+    uint32_t dmaUs = 0, dmaKBs = 0, dmaFail = 0;
+    const uint32_t trySizes[2] = { kDmaMaxBytes, 65536U };
+    for (unsigned s = 0; s < 2 && !gDmaDesc; ++s) {
+      IOBufferMemoryDescriptor *desc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+          kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, trySizes[s], 0xffffffffULL);
+      if (!desc) {
+        continue;
+      }
+      if (desc->prepare(kIODirectionInOut) == kIOReturnSuccess) {
+        IOByteCount segLen = 0;
+        IOPhysicalAddress phys = desc->getPhysicalSegment(0, &segLen, kIOMemoryMapperNone);
+        uint8_t *virt = static_cast<uint8_t *>(desc->getBytesNoCopy());
+        if (virt && phys && segLen >= trySizes[s] && phys + trySizes[s] <= 0x100000000ULL) {
+          gDmaDesc = desc;
+          gDmaVirt = virt;
+          gDmaPhys = static_cast<uint64_t>(phys);
+          gDmaBlocks = trySizes[s] / kBlockSize;
+          break;
+        }
+        desc->complete(kIODirectionInOut);
+      }
+      desc->release();
+    }
+
+    if (gDmaDesc && haveRef) {
+      // Switch controller to DMA mode and verify bit-exact + 1 MiB throughput.
+      write32(fBase, MSDC_CFG, (read32(fBase, MSDC_CFG) | MSDC_CFG_MODE) & ~MSDC_CFG_PIO);
+      uint64_t t0 = emmcNowUs();
+      bool allOk = true;
+      bool matchOk = true;
+      uint32_t doneBlk = 0;
+      while (doneBlk < kTransferBlocks) {
+        uint32_t chunk = kTransferBlocks - doneBlk;
+        if (chunk > gDmaBlocks) {
+          chunk = gDmaBlocks;
+        }
+        if (!readBlocksDma(fBase, kUserdataLba + doneBlk, chunk, gDmaVirt, gDmaPhys, &dmaFail)) {
+          allOk = false;
+          break;
+        }
+        if (doneBlk == 0 && memcmp(refHead, gDmaVirt, sizeof(refHead)) != 0) {
+          matchOk = false;
+          dmaFail = 9;
+          break;
+        }
+        doneBlk += chunk;
+      }
+      uint64_t dt = emmcNowUs() - t0;
+      dmaUs = static_cast<uint32_t>(dt > 0xffffffffULL ? 0xffffffffULL : dt);
+      if (allOk && matchOk && dt > 0) {
+        dmaKBs = static_cast<uint32_t>((static_cast<uint64_t>(kTransferBytes) * 1000ULL) / dt);
+        gUseDma = true;
+      } else {
+        gUseDma = false;
+        resetController(fBase);
+      }
+    }
+
+    Registers r = snapshot(fBase);
+    uint32_t ckdiv = (r.cfg >> 8) & 0xfffU;
+    uint32_t ckmod = (r.cfg >> 20) & 0x3U;
     if (native_musb_log_printf) {
       native_musb_log_printf(
-          "[EMMC] cfg=%08x(ckmod=%u ckdiv=%u) sdccfg=%08x(bw=%u->%u sw=%08x) emmc0=%08x top0=%08x | 1M_pio=%uus (%u.%u MB/s fail=%u)\n",
-          r.cfg, ckmod, ckdiv, r.sdcCfg, bwBefore, busWidth, swResp, r.emmcCfg0, read32(fTop, 0),
-          benchUs, benchKBs / 1000U, (benchKBs % 1000U) / 100U, benchFail);
+          "[EMMC] cfg=%08x(ckmod=%u ckdiv=%u) sdccfg=%08x(bw=%u->%u ddr=%u) | pio=%u.%uMB/s(%uus f=%u) | dma=%u.%uMB/s(%uus ok=%u f=%u buf=%uK)\n",
+          r.cfg, ckmod, ckdiv, r.sdcCfg, bwBefore, busWidth, ddrOk ? 1U : 0U,
+          pioKBs / 1000U, (pioKBs % 1000U) / 100U, pioUs, pioFail,
+          dmaKBs / 1000U, (dmaKBs % 1000U) / 100U, dmaUs, gUseDma ? 1U : 0U, dmaFail,
+          (gDmaBlocks * kBlockSize) >> 10);
     }
-    IOLog("NativeEmmc: cfg=%08x ckmod=%u ckdiv=%u bw=%u 1M_pio=%uus (%u.%u MB/s fail=%u)\n",
-          r.cfg, ckmod, ckdiv, busWidth, benchUs, benchKBs / 1000U, (benchKBs % 1000U) / 100U, benchFail);
+    IOLog("NativeEmmc: bw=%u->%u ddr=%u pio=%u.%uMB/s dma=%u.%uMB/s(ok=%u f=%u)\n",
+          bwBefore, busWidth, ddrOk ? 1U : 0U,
+          pioKBs / 1000U, (pioKBs % 1000U) / 100U,
+          dmaKBs / 1000U, (dmaKBs % 1000U) / 100U, gUseDma ? 1U : 0U, dmaFail);
   }
   EmmcLayout *layout = static_cast<EmmcLayout *>(IOMalloc(sizeof(EmmcLayout)));
   if (!layout || !findEmmcLayout(fBase, layout)) {
