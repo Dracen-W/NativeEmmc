@@ -20,10 +20,12 @@
 #include <libkern/libkern.h>
 #include <libkern/crypto/sha2.h>
 #include <kern/thread.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
 
 extern "C" __attribute__((weak)) void native_gop_text(unsigned int line, const char *text);
+extern "C" __attribute__((weak)) void native_musb_log_printf(const char *fmt, ...);
 extern "C" volatile uint32_t native_emmc_probe_calls;
 extern "C" volatile uint32_t native_emmc_matched;
 extern "C" volatile uint32_t native_emmc_probe_requested;
@@ -35,6 +37,8 @@ volatile uint32_t native_emmc_probe_requested = 0;
 volatile uint32_t native_emmc_blocks_published = 0;
 volatile uint64_t native_emmc_block_reads = 0;
 volatile uint64_t native_emmc_block_failures = 0;
+volatile uint64_t native_emmc_blocks_read_total = 0;
+volatile uint64_t native_emmc_read_us_total = 0;
 }
 
 namespace {
@@ -101,12 +105,20 @@ static inline void write32(uintptr_t base, uint32_t offset, uint32_t value)
   *reinterpret_cast<volatile uint32_t *>(base + offset) = value;
 }
 
+static inline uint64_t emmcNowUs()
+{
+  uint64_t now = 0, ns = 0;
+  clock_get_uptime(&now);
+  absolutetime_to_nanoseconds(now, &ns);
+  return ns / 1000ULL;
+}
+
 static inline void pollPause(unsigned iteration)
 {
   if (iteration < kSpinPolls) {
     __asm__ volatile("yield" ::: "memory");
   } else if ((iteration & 63U) == 0U) {
-    IODelay(iteration < 65536U ? 5 : 50);
+    IODelay(iteration < 65536U ? 1 : 10);
   } else {
     __asm__ volatile("yield" ::: "memory");
   }
@@ -123,6 +135,7 @@ static void resetController(uintptr_t base)
     IODelay(1);
   }
   write32(base, MSDC_INT, 0xffffffffU);
+  write32(base, MSDC_CFG, read32(base, MSDC_CFG) | MSDC_CFG_MODE | MSDC_CFG_PIO);
 }
 
 static uintptr_t mapPhys(uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
@@ -234,7 +247,7 @@ static bool readBlocks(uintptr_t base, uint64_t lba, uint32_t blocks, uint8_t *o
   write32(base, MSDC_FIFOCS, MSDC_FIFOCS_CLR);
   for (unsigned clrSpin = 0; clrSpin < 100000U && (read32(base, MSDC_FIFOCS) & MSDC_FIFOCS_CLR); ++clrSpin) {
   }
-  write32(base, MSDC_CFG, read32(base, MSDC_CFG) | MSDC_CFG_MODE | MSDC_CFG_PIO);
+  /* MSDC_CFG_MODE | MSDC_CFG_PIO is latched at startRoot() and resetController(). */
 
   if (!waitNotBusy(base, failure)) {
     return false;
@@ -280,6 +293,18 @@ static bool readBlocks(uintptr_t base, uint64_t lba, uint32_t blocks, uint8_t *o
     uint32_t available = read32(base, MSDC_FIFOCS) & MSDC_FIFOCS_RX_MASK;
     if (available >= 4) {
       do {
+        while (available >= 16 && got + 16 <= total) {
+          uint32_t w0 = read32(base, MSDC_RXDATA);
+          uint32_t w1 = read32(base, MSDC_RXDATA);
+          uint32_t w2 = read32(base, MSDC_RXDATA);
+          uint32_t w3 = read32(base, MSDC_RXDATA);
+          __builtin_memcpy(out + got, &w0, 4);
+          __builtin_memcpy(out + got + 4, &w1, 4);
+          __builtin_memcpy(out + got + 8, &w2, 4);
+          __builtin_memcpy(out + got + 12, &w3, 4);
+          got += 16;
+          available -= 16;
+        }
         while (available >= 4 && got + 4 <= total) {
           uint32_t word = read32(base, MSDC_RXDATA);
           __builtin_memcpy(out + got, &word, sizeof(word));
@@ -737,6 +762,7 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
     }
     uint32_t failure = 0;
     bool ok = false;
+    const uint64_t t0 = emmcNowUs();
     IOLockLock(gControllerLock);
     for (unsigned attempt = 0; attempt < 4; ++attempt) {
       failure = 0;
@@ -755,6 +781,7 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
       IODelay(1000 * (attempt + 1));
     }
     IOLockUnlock(gControllerLock);
+    __atomic_fetch_add(&native_emmc_read_us_total, emmcNowUs() - t0, __ATOMIC_RELAXED);
     if (!ok) {
       result = kIOReturnIOError;
       break;
@@ -766,6 +793,7 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
     }
     done += n;
     __atomic_fetch_add(&native_emmc_block_reads, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_emmc_blocks_read_total, n, __ATOMIC_RELAXED);
   }
   IOLockUnlock(windowLock);
   if (result != kIOReturnSuccess) {
@@ -911,6 +939,36 @@ static bool buildPublicationPlan(const EmmcLayout *layout)
 
 bool NativeEmmc::startRoot(IOService *provider)
 {
+  write32(fBase, MSDC_CFG, read32(fBase, MSDC_CFG) | MSDC_CFG_MODE | MSDC_CFG_PIO);
+  {
+    Registers r = snapshot(fBase);
+    uint32_t ckdiv = (r.cfg >> 8) & 0xfffU;
+    uint32_t ckmod = (r.cfg >> 20) & 0x3U;
+    uint32_t bwBits = (r.sdcCfg >> 16) & 0x3U;
+    uint32_t busWidth = (bwBits == 2U) ? 8U : ((bwBits == 1U) ? 4U : 1U);
+    uint32_t benchUs = 0;
+    uint32_t benchKBs = 0;
+    uint32_t benchFail = 0;
+    uint8_t *benchBuf = static_cast<uint8_t *>(IOMalloc(kTransferBytes));
+    if (benchBuf) {
+      uint64_t t0 = emmcNowUs();
+      bool ok = readBlocks(fBase, kUserdataLba, kTransferBlocks, benchBuf, &benchFail);
+      uint64_t dt = emmcNowUs() - t0;
+      benchUs = static_cast<uint32_t>(dt > 0xffffffffULL ? 0xffffffffULL : dt);
+      if (ok && dt > 0) {
+        benchKBs = static_cast<uint32_t>((static_cast<uint64_t>(kTransferBytes) * 1000ULL) / dt);
+      }
+      IOFree(benchBuf, kTransferBytes);
+    }
+    if (native_musb_log_printf) {
+      native_musb_log_printf(
+          "[EMMC] cfg=%08x(ckmod=%u ckdiv=%u) sdccfg=%08x(bw=%u) emmc0=%08x top0=%08x | 1M_pio=%uus (%u.%u MB/s fail=%u)\n",
+          r.cfg, ckmod, ckdiv, r.sdcCfg, busWidth, r.emmcCfg0, read32(fTop, 0),
+          benchUs, benchKBs / 1000U, (benchKBs % 1000U) / 100U, benchFail);
+    }
+    IOLog("NativeEmmc: cfg=%08x ckmod=%u ckdiv=%u bw=%u 1M_pio=%uus (%u.%u MB/s fail=%u)\n",
+          r.cfg, ckmod, ckdiv, busWidth, benchUs, benchKBs / 1000U, (benchKBs % 1000U) / 100U, benchFail);
+  }
   EmmcLayout *layout = static_cast<EmmcLayout *>(IOMalloc(sizeof(EmmcLayout)));
   if (!layout || !findEmmcLayout(fBase, layout)) {
     panic("NATIVE_EMMC root manifest read failed");
@@ -998,6 +1056,7 @@ bool NativeEmmc::start(IOService *provider)
   }
 
   if (probe == 2) {
+    write32(fBase, MSDC_CFG, read32(fBase, MSDC_CFG) | MSDC_CFG_MODE | MSDC_CFG_PIO);
     uint8_t block[kBlockSize] = {};
     uint32_t failure = 0;
     bool ok = readBlocks(fBase, kUserdataLba, 1, block, &failure);
