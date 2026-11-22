@@ -146,6 +146,8 @@ static inline void pollPause(unsigned iteration)
   }
 }
 
+static bool gUseDma = false;
+
 static void resetController(uintptr_t base)
 {
   write32(base, MSDC_CFG, read32(base, MSDC_CFG) | MSDC_CFG_RST);
@@ -771,7 +773,6 @@ static uintptr_t gControllerBase = 0;
 static uint64_t gWindowLba[4];
 static uint64_t gWindowBytes[4];
 static unsigned gWindowCount;
-static bool gUseDma = false;
 static IOBufferMemoryDescriptor *gDmaDesc = nullptr;
 static uint8_t *gDmaVirt = nullptr;
 static uint64_t gDmaPhys = 0;
@@ -1253,7 +1254,7 @@ bool NativeEmmc::startRoot(IOService *provider)
     const uint32_t trySizes[2] = { kDmaMaxBytes, 65536U };
     for (unsigned s = 0; s < 2 && !gDmaDesc; ++s) {
       IOBufferMemoryDescriptor *desc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-          kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, trySizes[s], 0xffffffffULL);
+          kernel_task, static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous), trySizes[s], 0xffffffffULL);
       if (!desc) {
         continue;
       }
