@@ -277,7 +277,10 @@ static bool readBlocks(uintptr_t base, uint64_t lba, uint32_t blocks, uint8_t *o
   write32(base, MSDC_FIFOCS, MSDC_FIFOCS_CLR);
   for (unsigned clrSpin = 0; clrSpin < 100000U && (read32(base, MSDC_FIFOCS) & MSDC_FIFOCS_CLR); ++clrSpin) {
   }
-  /* MSDC_CFG_MODE | MSDC_CFG_PIO is latched at startRoot() and resetController(). */
+  uint32_t pioCfg = read32(base, MSDC_CFG);
+  if ((pioCfg & (MSDC_CFG_MODE | MSDC_CFG_PIO)) != (MSDC_CFG_MODE | MSDC_CFG_PIO)) {
+    write32(base, MSDC_CFG, pioCfg | MSDC_CFG_MODE | MSDC_CFG_PIO);
+  }
 
   if (!waitNotBusy(base, failure)) {
     return false;
@@ -547,6 +550,11 @@ static bool readBlocksDma(uintptr_t base, uint64_t lba, uint32_t blocks,
     return false;
   }
 
+  uint32_t dmaCfg = read32(base, MSDC_CFG);
+  if ((dmaCfg & (MSDC_CFG_MODE | MSDC_CFG_PIO)) != MSDC_CFG_MODE) {
+    write32(base, MSDC_CFG, (dmaCfg | MSDC_CFG_MODE) & ~MSDC_CFG_PIO);
+  }
+  write32(base, MSDC_DMA_CFG, 0);
   write32(base, MSDC_INTEN, 0);
   clearStatus(base, 0xffffffffU);
   write32(base, MSDC_FIFOCS, MSDC_FIFOCS_CLR);
@@ -1036,7 +1044,7 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
   IOLockLock(windowLock);
   while (done < count) {
     const bool useDma = gUseDma && gDmaVirt && gDmaPhys && gDmaBlocks > 0;
-    uint32_t maxChunk = useDma ? gDmaBlocks : kTransferBlocks;
+    uint32_t maxChunk = (useDma && gDmaBlocks <= kTransferBlocks) ? gDmaBlocks : kTransferBlocks;
     uint32_t n = static_cast<uint32_t>(count - done);
     if (n > maxChunk) {
       n = maxChunk;
@@ -1045,9 +1053,14 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
     bool ok = false;
     const uint64_t t0 = emmcNowUs();
     IOLockLock(gControllerLock);
+    bool attemptDma = useDma;
     for (unsigned attempt = 0; attempt < 4; ++attempt) {
       failure = 0;
-      ok = useDma
+      if (attemptDma && attempt >= 2) {
+        attemptDma = false;
+        gUseDma = false;
+      }
+      ok = attemptDma
                ? readBlocksDma(gControllerBase, absoluteLba + block + done, n, gDmaVirt, gDmaPhys, &failure)
                : readBlocks(gControllerBase, absoluteLba + block + done, n, bounce, &failure);
       if (ok) {
@@ -1066,7 +1079,7 @@ IOReturn NativeEmmcBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 bl
     const IOByteCount chunkBytes = static_cast<IOByteCount>(n) * kBlockSize;
     bool copyOk = false;
     if (ok) {
-      const void *srcBuf = useDma ? static_cast<const void *>(gDmaVirt) : static_cast<const void *>(bounce);
+      const void *srcBuf = attemptDma ? static_cast<const void *>(gDmaVirt) : static_cast<const void *>(bounce);
       copyOk = (buffer->writeBytes(done * kBlockSize, srcBuf, chunkBytes) == chunkBytes);
     }
     IOLockUnlock(gControllerLock);
