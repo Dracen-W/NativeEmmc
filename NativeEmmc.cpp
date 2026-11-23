@@ -107,15 +107,43 @@ constexpr uint32_t SDC_CFG_BUSWIDTH_MASK = 3U << SDC_CFG_BUSWIDTH_SHIFT;
 // JEDEC eMMC R1 response error bits (Linux include/linux/mmc/mmc.h).
 constexpr uint32_t kR1ErrorMask = 0xFDF9A080U;
 
+// Unified CONFIG_XNU_DW_NATIVEEMMC_* defaults (overridden by board/OS config at build time).
+#ifndef CONFIG_XNU_DW_NATIVEEMMC_TRANSFER_BLOCKS
+#define CONFIG_XNU_DW_NATIVEEMMC_TRANSFER_BLOCKS 2048
+#endif
+#ifndef CONFIG_XNU_DW_NATIVEEMMC_SPIN_POLLS
+#define CONFIG_XNU_DW_NATIVEEMMC_SPIN_POLLS 4096
+#endif
+#ifndef CONFIG_XNU_DW_NATIVEEMMC_USERDATA_LBA
+#define CONFIG_XNU_DW_NATIVEEMMC_USERDATA_LBA 20332544ULL
+#endif
+#ifndef CONFIG_XNU_DW_NATIVEEMMC_USERDATA_BYTES
+#define CONFIG_XNU_DW_NATIVEEMMC_USERDATA_BYTES 114597789696ULL
+#endif
+#ifndef CONFIG_XNU_DW_NATIVEEMMC_OS_UUID
+#ifdef CONFIG_XNU_DW_APFS_OS_UUID
+#define CONFIG_XNU_DW_NATIVEEMMC_OS_UUID CONFIG_XNU_DW_APFS_OS_UUID
+#else
+#define CONFIG_XNU_DW_NATIVEEMMC_OS_UUID "04769D26-2CA0-4825-B443-E2E5F88300F2"
+#endif
+#endif
+#ifndef CONFIG_XNU_DW_NATIVEEMMC_SYSTEMOS_UUID
+#ifdef CONFIG_XNU_DW_APFS_SYSTEMOS_UUID
+#define CONFIG_XNU_DW_NATIVEEMMC_SYSTEMOS_UUID CONFIG_XNU_DW_APFS_SYSTEMOS_UUID
+#else
+#define CONFIG_XNU_DW_NATIVEEMMC_SYSTEMOS_UUID "8846FE78-2910-4297-AF97-D59BB6F8FC16"
+#endif
+#endif
+
 constexpr uint32_t kBlockSize = 512;
-constexpr uint32_t kTransferBlocks = 2048;
+constexpr uint32_t kTransferBlocks = CONFIG_XNU_DW_NATIVEEMMC_TRANSFER_BLOCKS;
 constexpr uint32_t kTransferBytes = kTransferBlocks * kBlockSize;
-constexpr unsigned kSpinPolls = 4096;
+constexpr unsigned kSpinPolls = CONFIG_XNU_DW_NATIVEEMMC_SPIN_POLLS;
 constexpr unsigned kMaxPolls = 1000000;
 // p45 starts at 20332544 512-byte sectors in the eMMC user area. The root
-// manifest is at the beginning of the iPadOS userdata image.
-constexpr uint64_t kUserdataLba = 20332544ULL;
-constexpr uint64_t kUserdataBytes = 114597789696ULL;
+// manifest is at the beginning of the OS userdata image.
+constexpr uint64_t kUserdataLba = CONFIG_XNU_DW_NATIVEEMMC_USERDATA_LBA;
+constexpr uint64_t kUserdataBytes = CONFIG_XNU_DW_NATIVEEMMC_USERDATA_BYTES;
 
 static inline uint32_t read32(uintptr_t base, uint32_t offset)
 {
@@ -852,12 +880,24 @@ static bool native_emmc_uuid_equals(const char *left, const char *right)
 
 static const char *native_emmc_window_for_uuid(const char *uuid)
 {
-  if (native_emmc_uuid_equals(uuid, "04769D26-2CA0-4825-B443-E2E5F88300F2")) {
+  if (native_emmc_uuid_equals(uuid, CONFIG_XNU_DW_NATIVEEMMC_OS_UUID)) {
     return "OS";
   }
-  if (native_emmc_uuid_equals(uuid, "8846FE78-2910-4297-AF97-D59BB6F8FC16")) {
+#ifdef CONFIG_XNU_DW_NATIVEEMMC_EXTRA_OS_UUID
+  if (CONFIG_XNU_DW_NATIVEEMMC_EXTRA_OS_UUID[0] &&
+      native_emmc_uuid_equals(uuid, CONFIG_XNU_DW_NATIVEEMMC_EXTRA_OS_UUID)) {
+    return "OS";
+  }
+#endif
+  if (native_emmc_uuid_equals(uuid, CONFIG_XNU_DW_NATIVEEMMC_SYSTEMOS_UUID)) {
     return "SystemOS";
   }
+#ifdef CONFIG_XNU_DW_NATIVEEMMC_EXTRA_SYSTEMOS_UUID
+  if (CONFIG_XNU_DW_NATIVEEMMC_EXTRA_SYSTEMOS_UUID[0] &&
+      native_emmc_uuid_equals(uuid, CONFIG_XNU_DW_NATIVEEMMC_EXTRA_SYSTEMOS_UUID)) {
+    return "SystemOS";
+  }
+#endif
   return nullptr;
 }
 
